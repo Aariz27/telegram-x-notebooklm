@@ -82,16 +82,25 @@ jobs:
           NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
         run: |
           DEPTH="${{ github.event.inputs.research_depth }}"
-          echo "🔍 Starting $DEPTH research: ${{ github.event.inputs.research_query }}"
-          if [ "$DEPTH" = "deep" ]; then
-            notebooklm source add-research "${{ github.event.inputs.research_query }}" \
-              --mode deep --no-wait \
-              --notebook ${{ steps.create.outputs.notebook_id }}
-          else
-            notebooklm source add-research "${{ github.event.inputs.research_query }}" \
-              --mode fast --import-all \
-              --notebook ${{ steps.create.outputs.notebook_id }}
-          fi
+          # Random stagger (10-60s) to avoid hitting rate limits with parallel runs
+          JITTER=$((RANDOM % 50 + 10))
+          echo "⏳ Staggering $JITTER seconds to avoid rate limits..."
+          sleep $JITTER
+
+          for ATTEMPT in 1 2 3; do
+            echo "🔍 Attempt $ATTEMPT: Starting $DEPTH research: ${{ github.event.inputs.research_query }}"
+            if [ "$DEPTH" = "deep" ]; then
+              notebooklm source add-research "${{ github.event.inputs.research_query }}" \
+                --mode deep --no-wait \
+                --notebook ${{ steps.create.outputs.notebook_id }} && break
+            else
+              notebooklm source add-research "${{ github.event.inputs.research_query }}" \
+                --mode fast --import-all \
+                --notebook ${{ steps.create.outputs.notebook_id }} && break
+            fi
+            echo "⚠️ Research attempt $ATTEMPT failed, waiting 30s before retry..."
+            sleep 30
+          done
           echo "✅ Research done"
 
       - name: Wait for deep research to import
