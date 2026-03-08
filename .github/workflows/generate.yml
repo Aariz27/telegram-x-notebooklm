@@ -1,4 +1,4 @@
-name: 🤖 Telegram x NotebookLM
+name: Telegram x NotebookLM
 
 on:
   workflow_dispatch:
