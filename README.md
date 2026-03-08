@@ -43,3 +43,4 @@ pip install notebooklm-py
 notebooklm login
 cat ~/.notebooklm/storage_state.json  # paste this into the NOTEBOOKLM_AUTH_JSON secret
 ```
+
