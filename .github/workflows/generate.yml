@@ -7,28 +7,22 @@ on:
         description: "Title for the NotebookLM notebook"
         required: true
         type: string
-      artifact_type:
-        description: "Type: audio, slide-deck, report, quiz, flashcards, mind-map, infographic, video"
+      artifacts_json:
+        description: "JSON array of artifacts: [{type, length}, ...]"
         required: true
         type: string
-        default: "audio"
-      artifact_length:
-        description: "Length: short, default, long"
-        required: false
-        type: string
-        default: "short"
       research_query:
         description: "Search query for web research (leave empty to skip)"
         required: false
         type: string
         default: ""
       research_depth:
-        description: "Research depth: fast (5-10 sources, instant) or deep (20+ sources, 5-10 min)"
+        description: "Research depth: fast (default) or deep"
         required: false
         type: string
         default: "fast"
       source_urls:
-        description: "Comma-separated URLs to add as sources (leave empty to skip)"
+        description: "Comma-separated URLs to add as sources"
         required: false
         type: string
         default: ""
@@ -41,7 +35,7 @@ on:
 jobs:
   generate-and-send:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Install notebooklm-py
@@ -53,8 +47,9 @@ jobs:
           NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
         run: |
           RESULT=$(notebooklm create "${{ github.event.inputs.notebook_title }}" --json)
-          echo "notebook_id=$(echo $RESULT | python3 -c "import sys,json; print(json.load(sys.stdin)['notebook']['id'])")" >> $GITHUB_OUTPUT
-          echo "✅ Notebook created: ${{ github.event.inputs.notebook_title }}"
+          NB_ID=$(echo $RESULT | python3 -c "import sys,json; print(json.load(sys.stdin)['notebook']['id'])")
+          echo "notebook_id=$NB_ID" >> $GITHUB_OUTPUT
+          echo "✅ Notebook created: ${{ github.event.inputs.notebook_title }} ($NB_ID)"
 
       - name: Add text source
         if: ${{ github.event.inputs.briefing_text != '' }}
@@ -75,7 +70,6 @@ jobs:
           for url in "${URLS[@]}"; do
             url=$(echo "$url" | xargs)
             if [ -n "$url" ]; then
-              echo "Adding URL: $url"
               notebooklm source add "$url" \
                 --notebook ${{ steps.create.outputs.notebook_id }} --json || true
             fi
@@ -94,122 +88,102 @@ jobs:
               --mode deep --no-wait \
               --notebook ${{ steps.create.outputs.notebook_id }}
           else
-            # Fast mode is synchronous — import-all works fine with 5-10 sources
             notebooklm source add-research "${{ github.event.inputs.research_query }}" \
               --mode fast --import-all \
               --notebook ${{ steps.create.outputs.notebook_id }}
           fi
-          echo "✅ Research started"
+          echo "✅ Research done"
 
-      - name: Wait for deep research to complete and import
+      - name: Wait for deep research to import
         if: ${{ github.event.inputs.research_query != '' && github.event.inputs.research_depth == 'deep' }}
         env:
           NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
         run: |
-          echo "⏳ Waiting for deep research to complete and import..."
-          # || true: partial import failures (e.g. 100+ sources) are non-fatal
           notebooklm research wait \
             -n ${{ steps.create.outputs.notebook_id }} \
             --import-all --timeout 600 || true
-          echo "✅ Research import done (or partially imported)"
+          echo "✅ Research imported"
 
       - name: Wait for sources to be indexed
         env:
           NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
         run: |
-          echo "⏳ Waiting for all sources to finish indexing..."
+          echo "⏳ Waiting for sources to index..."
           for i in $(seq 1 30); do
             OUTPUT=$(notebooklm source list --notebook ${{ steps.create.outputs.notebook_id }} --json)
             COUNT=$(echo $OUTPUT | python3 -c "import sys,json; print(len(json.load(sys.stdin)['sources']))")
-            STATUS=$(echo $OUTPUT | python3 -c "import sys,json; sources=json.load(sys.stdin)['sources']; print(len(sources) > 0 and all(s['status']=='ready' for s in sources))")
+            STATUS=$(echo $OUTPUT | python3 -c "import sys,json; s=json.load(sys.stdin)['sources']; print(len(s) > 0 and all(x['status']=='ready' for x in s))")
             echo "Sources: $COUNT total, all ready: $STATUS (attempt $i/30)"
             if [ "$STATUS" = "True" ]; then break; fi
             sleep 20
           done
 
-      - name: Generate artifact
-        id: generate
+      - name: Generate and deliver all artifacts
         env:
           NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          ARTIFACT_TYPE="${{ github.event.inputs.artifact_type }}"
-          LENGTH="${{ github.event.inputs.artifact_length }}"
-          echo "🎨 Generating $ARTIFACT_TYPE..."
+          NOTEBOOK_ID="${{ steps.create.outputs.notebook_id }}"
+          ARTIFACTS='${{ github.event.inputs.artifacts_json }}'
+          COUNT=$(echo "$ARTIFACTS" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))")
+          echo "🎨 Generating $COUNT artifact(s)..."
 
-          # mind-map is sync (no wait needed), others are async
-          if [ "$ARTIFACT_TYPE" = "mind-map" ]; then
-            RESULT=$(notebooklm generate mind-map \
-              --notebook ${{ steps.create.outputs.notebook_id }} --json)
-          else
-            RESULT=$(notebooklm generate $ARTIFACT_TYPE \
+          for i in $(seq 0 $((COUNT-1))); do
+            TYPE=$(echo "$ARTIFACTS" | python3 -c "import sys,json; a=json.load(sys.stdin); print(a[$i]['type'])")
+            LENGTH=$(echo "$ARTIFACTS" | python3 -c "import sys,json; a=json.load(sys.stdin); print(a[$i].get('length','short'))")
+            NUM=$((i+1))
+            echo ""
+            echo "--- Artifact $NUM/$COUNT: $TYPE ($LENGTH) ---"
+
+            # Generate
+            RESULT=$(notebooklm generate $TYPE \
               --length $LENGTH \
-              --notebook ${{ steps.create.outputs.notebook_id }} --json)
-          fi
+              --notebook $NOTEBOOK_ID --json)
+            TASK_ID=$(echo "$RESULT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('task_id',''))")
+            echo "Task ID: $TASK_ID"
 
-          TASK_ID=$(echo $RESULT | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('task_id', ''))")
-          echo "task_id=$TASK_ID" >> $GITHUB_OUTPUT
-          echo "artifact_type=$ARTIFACT_TYPE" >> $GITHUB_OUTPUT
-          echo "✅ Generation started: $TASK_ID"
+            # Wait for completion
+            if [ -n "$TASK_ID" ]; then
+              notebooklm artifact wait $TASK_ID \
+                --notebook $NOTEBOOK_ID \
+                --timeout 3600
+            fi
 
-      - name: Wait for generation to complete
-        if: ${{ steps.generate.outputs.task_id != '' }}
-        env:
-          NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
-        run: |
-          echo "⏳ Waiting for generation..."
-          notebooklm artifact wait ${{ steps.generate.outputs.task_id }} \
-            --notebook ${{ steps.create.outputs.notebook_id }} \
-            --timeout 3600
+            # Map type → extension
+            case "$TYPE" in
+              audio)       EXT="mp3" ;;
+              video)       EXT="mp4" ;;
+              slide-deck)  EXT="pdf" ;;
+              report)      EXT="md"  ;;
+              mind-map)    EXT="json" ;;
+              quiz)        EXT="json" ;;
+              flashcards)  EXT="json" ;;
+              infographic) EXT="png" ;;
+              *)           EXT="bin" ;;
+            esac
 
-      - name: Download artifact
-        id: download
-        env:
-          NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
-        run: |
-          ARTIFACT_TYPE="${{ github.event.inputs.artifact_type }}"
+            OUT="/tmp/output-${i}.${EXT}"
+            notebooklm download $TYPE $OUT --notebook $NOTEBOOK_ID
+            echo "✅ Downloaded: $OUT"
 
-          # Map type to file extension
-          case "$ARTIFACT_TYPE" in
-            audio)      EXT="mp3" ;;
-            video)      EXT="mp4" ;;
-            slide-deck) EXT="pdf" ;;
-            report)     EXT="md"  ;;
-            mind-map)   EXT="json" ;;
-            quiz)       EXT="json" ;;
-            flashcards) EXT="json" ;;
-            infographic) EXT="png" ;;
-            *)          EXT="bin" ;;
-          esac
-
-          OUT="/tmp/output.$EXT"
-          notebooklm download $ARTIFACT_TYPE $OUT \
-            --notebook ${{ steps.create.outputs.notebook_id }}
-
-          echo "file_path=$OUT" >> $GITHUB_OUTPUT
-          echo "file_ext=$EXT" >> $GITHUB_OUTPUT
-          echo "✅ Downloaded: $OUT"
-
-      - name: Send to Telegram
-        run: |
-          FILE="${{ steps.download.outputs.file_path }}"
-          EXT="${{ steps.download.outputs.file_ext }}"
-          CAPTION="✅ ${{ github.event.inputs.notebook_title }} — ${{ github.event.inputs.artifact_type }} ready"
-
-          # Use sendAudio for mp3, sendDocument for everything else
-          if [ "$EXT" = "mp3" ]; then
-            curl -s \
-              -F chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
-              -F audio=@"$FILE" \
-              -F caption="$CAPTION" \
-              https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendAudio
-          else
-            curl -s \
-              -F chat_id=${{ secrets.TELEGRAM_CHAT_ID }} \
-              -F document=@"$FILE" \
-              -F caption="$CAPTION" \
-              https://api.telegram.org/bot${{ secrets.TELEGRAM_BOT_TOKEN }}/sendDocument
-          fi
-          echo "✅ Sent to Telegram"
+            # Send to Telegram
+            CAPTION="✅ ${{ github.event.inputs.notebook_title }} — $TYPE ($NUM/$COUNT)"
+            if [ "$EXT" = "mp3" ]; then
+              curl -s \
+                -F chat_id=$TELEGRAM_CHAT_ID \
+                -F audio=@"$OUT" \
+                -F caption="$CAPTION" \
+                https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendAudio
+            else
+              curl -s \
+                -F chat_id=$TELEGRAM_CHAT_ID \
+                -F document=@"$OUT" \
+                -F caption="$CAPTION" \
+                https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendDocument
+            fi
+            echo "✅ Sent to Telegram"
+          done
 
       - name: Cleanup notebook
         if: always()
