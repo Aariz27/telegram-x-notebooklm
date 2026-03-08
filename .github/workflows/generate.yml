@@ -22,6 +22,11 @@ on:
         required: false
         type: string
         default: ""
+      research_depth:
+        description: "Research depth: fast (5-10 sources, instant) or deep (20+ sources, 5-10 min)"
+        required: false
+        type: string
+        default: "fast"
       source_urls:
         description: "Comma-separated URLs to add as sources (leave empty to skip)"
         required: false
@@ -77,27 +82,36 @@ jobs:
           done
           echo "✅ URL sources added"
 
-      - name: Start web research (non-blocking)
+      - name: Web research
         if: ${{ github.event.inputs.research_query != '' }}
         env:
           NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
         run: |
-          echo "🔍 Starting research: ${{ github.event.inputs.research_query }}"
-          notebooklm source add-research "${{ github.event.inputs.research_query }}" \
-            --mode deep --no-wait \
-            --notebook ${{ steps.create.outputs.notebook_id }}
-          echo "✅ Research started (non-blocking)"
+          DEPTH="${{ github.event.inputs.research_depth }}"
+          echo "🔍 Starting $DEPTH research: ${{ github.event.inputs.research_query }}"
+          if [ "$DEPTH" = "deep" ]; then
+            notebooklm source add-research "${{ github.event.inputs.research_query }}" \
+              --mode deep --no-wait \
+              --notebook ${{ steps.create.outputs.notebook_id }}
+          else
+            # Fast mode is synchronous — import-all works fine with 5-10 sources
+            notebooklm source add-research "${{ github.event.inputs.research_query }}" \
+              --mode fast --import-all \
+              --notebook ${{ steps.create.outputs.notebook_id }}
+          fi
+          echo "✅ Research started"
 
-      - name: Wait for research to complete and import sources
-        if: ${{ github.event.inputs.research_query != '' }}
+      - name: Wait for deep research to complete and import
+        if: ${{ github.event.inputs.research_query != '' && github.event.inputs.research_depth == 'deep' }}
         env:
           NOTEBOOKLM_AUTH_JSON: ${{ secrets.NOTEBOOKLM_AUTH_JSON }}
         run: |
-          echo "⏳ Waiting for research to complete and import..."
+          echo "⏳ Waiting for deep research to complete and import..."
+          # || true: partial import failures (e.g. 100+ sources) are non-fatal
           notebooklm research wait \
             -n ${{ steps.create.outputs.notebook_id }} \
-            --import-all --timeout 600
-          echo "✅ Research imported"
+            --import-all --timeout 600 || true
+          echo "✅ Research import done (or partially imported)"
 
       - name: Wait for sources to be indexed
         env:
